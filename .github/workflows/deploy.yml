@@ -1,0 +1,86 @@
+name: A-08 - Build versionado e reprodutivel
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Definir SOURCE_DATE_EPOCH e o caminho da imagem
+        id: meta
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+          echo "IMAGE=${{ vars.AR_REGIAO || 'us-central1' }}-docker.pkg.dev/${{ vars.GCP_PROJETO }}/${{ vars.AR_REPOSITORIO }}/painel-cadunico" >> "$GITHUB_ENV"
+
+      - name: Preparar o buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Registrar a versao do BuildKit na evidencia
+        run: |
+          {
+            echo "### A-08 - dados do build"
+            echo ""
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- SOURCE_DATE_EPOCH: \`$SOURCE_DATE_EPOCH\`"
+            echo "- buildx: \`$(docker buildx version)\`"
+            echo "- BuildKit: \`$(docker buildx inspect --bootstrap | grep -i buildkit)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Publicacao depende da credencial pedida na A-03.
+      # Enquanto ela nao existir, deixe a variavel PUBLICAR sem valor: o build roda e
+      # registra o digest, mas nao envia a imagem.
+      - name: Autenticar no Google Cloud
+        if: vars.PUBLICAR == 'true'
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Entrar no Artifact Registry
+        if: vars.PUBLICAR == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.AR_REGIAO || 'us-central1' }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Build
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          provenance: false
+          sbom: false
+          no-cache: true
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          outputs: type=image,push=${{ vars.PUBLICAR == 'true' }},rewrite-timestamp=true
+
+      - name: Registrar o digest e salvar os metadados
+        run: |
+          cat > build-meta.json <<'JSON'
+          ${{ steps.build.outputs.metadata }}
+          JSON
+          echo "- Digest: \`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag: \`${{ env.IMAGE }}:sha-${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guardar os metadados do build
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-meta-${{ github.sha }}
+          path: build-meta.json
+          if-no-files-found: warn
